@@ -53,9 +53,9 @@ Examples:
     parser.add_argument(
         "--pipeline",
         type=str,
-        choices=["advanced", "base", "optimized"],
+        choices=["advanced", "enhanced", "base", "optimized"],
         default="advanced",
-        help="Which pipeline to run (default: advanced)",
+        help="Which pipeline to run (default: advanced). 'enhanced' adds fog/rain/night pixel enhancements.",
     )
     parser.add_argument(
         "--benchmark",
@@ -92,6 +92,9 @@ Examples:
 
     elif args.pipeline == "advanced":
         _run_advanced_pipeline(config_data)
+
+    elif args.pipeline == "enhanced":
+        _run_enhanced_pipeline(config_data)
 
     elif args.pipeline == "optimized":
         _run_optimized_pipeline()
@@ -148,6 +151,46 @@ def _run_advanced_pipeline(config_data):
     report.set_profiling(merged_stats)
 
     # Save report files (console already printed by the original pipeline)
+    report.save()
+
+
+def _run_enhanced_pipeline(config_data):
+    """Run enhanced pipeline with fog/rain/night pixel enhancements."""
+    print("Starting Enhanced Pipeline (fog/rain/night pixel enhancement)...")
+    print("=" * 78)
+
+    from src.enhanced_pipeline import main as run_enhanced
+    from src.enhanced_pipeline import (
+        timing_stats, merge_profile_logs,
+        VIDEO_PATH, COLOR_CHANNEL, NUM_ROWS, NUM_COLS,
+        ROI1, ROI2, DEFAULT_BATCH_SIZE, _USE_GRAYSCALE_FASTPATH,
+    )
+    from multiprocessing import cpu_count
+    import psutil
+    import numpy as np
+
+    execution_time = run_enhanced()
+
+    from src.grid_manager.report_writer import PipelineReport
+    merged_stats = merge_profile_logs(main_stats=timing_stats)
+
+    report = PipelineReport(pipeline_name="enhanced")
+    report.set_config(
+        video_path=VIDEO_PATH,
+        color_channel=COLOR_CHANNEL,
+        grid_rows=NUM_ROWS, grid_cols=NUM_COLS,
+        roi1=ROI1, roi2=ROI2,
+        batch_size=DEFAULT_BATCH_SIZE,
+        num_workers=max(1, cpu_count() - 1),
+        fastpath='grayscale' if _USE_GRAYSCALE_FASTPATH else 'HSV',
+    )
+    report.set_execution(
+        time_s=execution_time,
+        memory_mb=psutil.Process().memory_info().rss / (1024 ** 2),
+        frames=0,
+        fps=0,
+    )
+    report.set_profiling(merged_stats)
     report.save()
 
 
