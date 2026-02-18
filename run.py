@@ -10,6 +10,7 @@ Usage:
     python run.py --pipeline optimized                   # Run optimized pipeline
     python run.py --benchmark                            # Compare original vs optimized
     python run.py --help
+    python run.py --pipeline enhanced                    # Run enhanced pipeline
 """
 
 import argparse
@@ -62,6 +63,11 @@ Examples:
         action="store_true",
         help="Run both original and optimized pipelines and compare results",
     )
+    parser.add_argument(
+        "--fast",
+        action="store_true",
+        help="Enable fast mode for enhanced pipeline (faster but less visual polish)",
+    )
     args = parser.parse_args()
 
     # Verify config exists
@@ -94,7 +100,7 @@ Examples:
         _run_advanced_pipeline(config_data)
 
     elif args.pipeline == "enhanced":
-        _run_enhanced_pipeline(config_data)
+        _run_enhanced_pipeline(config_data, fast=args.fast)
 
     elif args.pipeline == "optimized":
         _run_optimized_pipeline()
@@ -154,9 +160,10 @@ def _run_advanced_pipeline(config_data):
     report.save()
 
 
-def _run_enhanced_pipeline(config_data):
+def _run_enhanced_pipeline(config_data, fast=False):
     """Run enhanced pipeline with fog/rain/night pixel enhancements."""
-    print("Starting Enhanced Pipeline (fog/rain/night pixel enhancement)...")
+    mode_label = "FAST" if fast else "full"
+    print(f"Starting Enhanced Pipeline ({mode_label} — fog/rain/night pixel enhancement)...")
     print("=" * 78)
 
     from src.enhanced_pipeline import main as run_enhanced
@@ -165,6 +172,8 @@ def _run_enhanced_pipeline(config_data):
         VIDEO_PATH, COLOR_CHANNEL, NUM_ROWS, NUM_COLS,
         ROI1, ROI2, DEFAULT_BATCH_SIZE, _USE_GRAYSCALE_FASTPATH,
     )
+    import src.enhanced_pipeline as _ep
+    _ep.FAST_MODE = fast
     from multiprocessing import cpu_count
     import psutil
     import numpy as np
