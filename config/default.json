@@ -1,17 +1,37 @@
 {
-  "video": "../MVI_39761/MVI_39761",
+  "video": "./data/MVI_39761",
   "color_channel": "gray",
   "grids": {
     "rows": 7,
     "cols": 14
   },
   "rois": {
-    "roi1": { "x": 545, "y": 159, "w": 284, "h": 140 },
-    "roi2": { "x": 238, "y": 161, "w": 284, "h": 140 }
+    "roi1": {
+      "x": 545,
+      "y": 159,
+      "w": 284,
+      "h": 140
+    },
+    "roi2": {
+      "x": 238,
+      "y": 161,
+      "w": 284,
+      "h": 140
+    }
   },
   "output": {
     "video_dir": "output/videos",
     "log_dir": "output/logs"
   },
-  "batch_size": 64
+  "batch_size": 64,
+  "optimization": {
+    "subsample_interval": 5,
+    "min_pixel_activity": 100,
+    "entry_rows": [
+      0,
+      -1
+    ],
+    "sentinel_threshold": 50,
+    "enabled": true
+  }
 }

@@ -1,0 +1,310 @@
+# Grid Optimization Add-On — Implementation Plan (v2)
+
+## Goal
+
+Implement the 4 optimization strategies from [strategy.md](file:///e:/WORK/additionalProject/LLVD/response/gemini/strategy.md) as a **completely separated module** that wraps the original pipeline. Your code lives in `src/grid_manager/`, the original stays untouched in `src/`.
+
+> [!IMPORTANT]
+> **v2 changes**: Fixed the Parallel Paradox — Strategy 2 (Delta) is now merged into Strategy 4 (Pixel Check) as a parallel-safe "Pixel Delta" instead of a "Grid Delta". Strategy 1 (Temporal) moved to main process. Folder renamed from `src/addons/` to `src/grid_manager/`.
+
+---
+
+## Architecture — Where Each Strategy Runs
+
+The key insight: **not all strategies can run in worker processes**. The cascade is split across main and worker:
+
+```mermaid
+graph TD
+    subgraph "Main Process (before pool.map)"
+        S1["Strategy 1: Temporal Sub-sampling<br/>frame_idx % interval != 0 → SKIP<br/>Don't even send to worker"]
+    end
+
+    subgraph "Worker Process (inside optimized_worker_task)"
+        S4["Strategy 4+2: Pixel Activity Check<br/>cv2.countNonZero(absdiff) < threshold → SKIP<br/>Parallel-safe merger of Delta + Pixel"]
+        S3["Strategy 3: Sentinel Boundary Check<br/>Only scan entry rows of grid<br/>If empty → SKIP full grid"]
+        FULL["Full Grid Computation<br/>Original process_single_roi()"]
+    end
+
+    S1 -->|"Not skipped"| S4
+    S4 -->|"Not skipped"| S3
+    S3 -->|"Not skipped"| FULL
+```
+
+### Why Strategy 2 (Grid Delta) Was Merged Into Strategy 4
+
+**The Parallel Paradox**: `multiprocessing.Pool` dispatches frames in batches simultaneously. When Worker B processes Frame 2, Frame 1 isn't finished yet — so we can't compare Grid(N) vs Grid(N-1).
+
+**The Fix**: Instead of comparing *grids*, compare *raw pixels*. Since [batch_roi_generator](file:///e:/WORK/additionalProject/LLVD/src/advanced_pipeline.py#496-561) already yields frame pairs [(prev, curr)](file:///e:/WORK/additionalProject/LLVD/src/base_pipeline.py#290-443), the worker *already has* the data for `cv2.absdiff(prev, curr)`. If the pixel diff is near zero, the grid *will* be identical — achieving the same goal without cross-frame state.
+
+---
+
+## Proposed Changes
+
+### Your Module (`src/grid_manager/`)
+
+#### [NEW] [__init__.py](file:///e:/WORK/additionalProject/LLVD/src/grid_manager/__init__.py)
+
+Empty init.
+
+---
+
+#### [NEW] [grid_optimizer.py](file:///e:/WORK/additionalProject/LLVD/src/grid_manager/grid_optimizer.py)
+
+The core optimization engine:
+
+```python
+class GridOptimizer:
+    """
+    Manages optimization state and Strategy 1 (Temporal) in the main process.
+    Strategies 3 & 4 are static methods callable from worker processes.
+    """
+    def __init__(self, total_cells, subsample_interval=5,
+                 min_pixel_activity=100, entry_rows=(0, -1)):
+        self.total_cells = total_cells
+        self.subsample_interval = subsample_interval
+        self.min_pixel_activity = min_pixel_activity
+        self.entry_rows = entry_rows
+
+        # Last known results for skipped frames
+        self.last_grid_roi1 = None
+        self.last_grid_roi2 = None
+        self.last_density_roi1 = 0.0
+        self.last_density_roi2 = 0.0
+        self.last_comps_roi1 = []
+        self.last_comps_roi2 = []
+
+        # Stats
+        self.stats = {
+            'skipped_temporal': 0, 'skipped_pixel': 0,
+            'skipped_sentinel': 0, 'computed': 0
+        }
+
+    # Strategy 1: Temporal — runs in MAIN process
+    def should_skip_temporal(self, frame_idx):
+        return frame_idx % self.subsample_interval != 0
+
+    def get_cached_result(self):
+        """Return last known grids/density/comps for skipped frames."""
+        return (self.last_grid_roi1, self.last_grid_roi2,
+                self.last_density_roi1, self.last_density_roi2,
+                self.last_comps_roi1, self.last_comps_roi2)
+
+    def update_cache(self, mat1, mat2, d1, d2, comps1, comps2):
+        """Store results from a computed frame."""
+        self.last_grid_roi1 = mat1
+        self.last_grid_roi2 = mat2
+        self.last_density_roi1 = d1
+        self.last_density_roi2 = d2
+        self.last_comps_roi1 = comps1
+        self.last_comps_roi2 = comps2
+
+    # Strategy 4+2: Pixel Activity — runs in WORKER process (static, no state)
+    @staticmethod
+    def should_skip_pixel_activity(roi_f1_gray, roi_f2_gray, threshold=100):
+        diff = cv2.absdiff(roi_f1_gray, roi_f2_gray)
+        return cv2.countNonZero(diff) < threshold
+
+    # Strategy 3: Sentinel — runs in WORKER process (static, no state)
+    @staticmethod
+    def should_skip_sentinel(roi_diff_gray, grid_h, entry_rows, threshold=50):
+        h = roi_diff_gray.shape[0]
+        for row_idx in entry_rows:
+            actual_row = row_idx if row_idx >= 0 else (h // grid_h) + row_idx
+            y_start = actual_row * grid_h
+            y_end = min(y_start + grid_h, h)
+            entry_strip = roi_diff_gray[y_start:y_end, :]
+            if cv2.countNonZero(entry_strip) > threshold:
+                return False  # Motion in entry row → can't skip
+        return True  # No motion in any entry row → skip
+
+    def print_stats(self):
+        total = sum(self.stats.values())
+        if total == 0: return
+        print(f"\n{'─' * 70}")
+        print(f"OPTIMIZATION STATS:")
+        for key, count in self.stats.items():
+            pct = count / total * 100
+            print(f"  {key:<25} {count:>6} ({pct:>5.1f}%)")
+        print(f"  {'total_frames':<25} {total:>6}")
+```
+
+---
+
+#### [NEW] [optimized_worker.py](file:///e:/WORK/additionalProject/LLVD/src/grid_manager/optimized_worker.py)
+
+Worker function with Strategies 3 & 4 integrated:
+
+```python
+from src.advanced_pipeline import (
+    process_single_roi, find_connected_components,
+    GRID_W1, GRID_H1, GRID_W2, GRID_H2, TOTAL_CELLS
+)
+from src.grid_manager.grid_optimizer import GridOptimizer
+
+def optimized_worker_task(args):
+    (frame_idx, r1f1, r1f2, r2f1, r2f2, lighting, is_foggy,
+     pixel_threshold, entry_rows) = args
+
+    results = []
+    for roi_f1, roi_f2, gw, gh in [(r1f1, r1f2, GRID_W1, GRID_H1),
+                                    (r2f1, r2f2, GRID_W2, GRID_H2)]:
+        g1 = cv2.cvtColor(roi_f1, cv2.COLOR_BGR2GRAY)
+        g2 = cv2.cvtColor(roi_f2, cv2.COLOR_BGR2GRAY)
+
+        # Strategy 4+2: Pixel Activity Check
+        if GridOptimizer.should_skip_pixel_activity(g1, g2, pixel_threshold):
+            results.append(('skip_pixel', None, 0.0, []))
+            continue
+
+        # Strategy 3: Sentinel Boundary Check
+        diff = cv2.absdiff(g1, g2)
+        _, diff_bin = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
+        if GridOptimizer.should_skip_sentinel(diff_bin, gh, entry_rows):
+            results.append(('skip_sentinel', None, 0.0, []))
+            continue
+
+        # All checks failed → full computation
+        mat = process_single_roi(roi_f1, roi_f2, gw, gh, lighting, is_foggy)
+        d = float(np.count_nonzero(mat)) / TOTAL_CELLS
+        comps = find_connected_components(mat)
+        comps_data = [{'centroid': c['centroid'], 'area': c['area'],
+                       'bbox': c['bbox']} for c in comps]
+        results.append(('computed', mat, d, comps_data))
+
+    return (frame_idx, results[0], results[1])
+```
+
+---
+
+#### [NEW] [optimized_pipeline.py](file:///e:/WORK/additionalProject/LLVD/src/grid_manager/optimized_pipeline.py)
+
+New [main()](file:///e:/WORK/additionalProject/LLVD-latest/honors_imp%20%281%29.py#445-448) that imports everything from original + rewires the loop:
+
+```python
+# Import ALL original functions — ZERO modifications to original code
+from src.advanced_pipeline import (
+    process_single_roi, find_connected_components, CentroidTracker,
+    batch_roi_generator, prefetch_batches, AsyncVideoWriter,
+    draw_grid_overlay, draw_tracking_info, draw_scene_info,
+    _equalize_frame_rois_adaptive, classify_scene,
+    ROI1, ROI2, GRID_W1, GRID_H1, GRID_W2, GRID_H2,
+    NUM_ROWS, NUM_COLS, TOTAL_CELLS, VIDEO_PATH,
+    ASSUMED_FPS, DEFAULT_BATCH_SIZE, _load_image_sequence,
+    timing_stats, merge_profile_logs, print_profiling_results,
+    LOG_DIR
+)
+
+def main(config_overrides=None):
+    optimizer = GridOptimizer(TOTAL_CELLS, ...)
+
+    # ... same setup as original main() ...
+
+    with Pool(processes=n_procs) as pool:
+        for batch in prefetch_batches(gen):
+            tasks = []
+            skipped_frames = []
+
+            for item in batch:
+                frame_idx = item[0]
+
+                # STRATEGY 1: Temporal (Main Process — don't send to worker)
+                if optimizer.should_skip_temporal(frame_idx):
+                    optimizer.stats['skipped_temporal'] += 1
+                    cached = optimizer.get_cached_result()
+                    skipped_frames.append((frame_idx, item[5], cached))
+                    continue
+
+                # Pack worker args with optimization params
+                tasks.append((*item[:7], pixel_threshold, entry_rows))
+
+            # Dispatch only non-skipped frames to workers
+            if tasks:
+                pool_results = pool.map(optimized_worker_task, tasks)
+                # Process results, update optimizer cache...
+
+            # For skipped frames, use cached results for visualization
+            # ...
+
+    optimizer.print_stats()
+```
+
+Output goes to `output/videos/output_optimized.mp4`.
+
+---
+
+#### [NEW] [benchmark.py](file:///e:/WORK/additionalProject/LLVD/src/grid_manager/benchmark.py)
+
+Side-by-side comparison:
+- Runs original `advanced_pipeline.main()` → records time, densities, counts
+- Runs `optimized_pipeline.main()` → records same metrics
+- Prints comparison table: speedup, accuracy diff, per-strategy skip rates
+
+---
+
+### Config & Entry Point Updates
+
+#### [MODIFY] [default.json](file:///e:/WORK/additionalProject/LLVD/config/default.json)
+
+```diff
++  "optimization": {
++    "subsample_interval": 5,
++    "min_pixel_activity": 100,
++    "entry_rows": [0, 6],
++    "enabled": true
++  }
+```
+
+#### [MODIFY] [run.py](file:///e:/WORK/additionalProject/LLVD/run.py)
+
+Add `--pipeline optimized` and `--benchmark` options.
+
+---
+
+## Final Folder Structure
+
+```
+LLVD/
+├── run.py                             # Updated: adds --pipeline optimized + --benchmark
+├── src/
+│   ├── advanced_pipeline.py           # ⛔ UNTOUCHED
+│   ├── base_pipeline.py               # ⛔ UNTOUCHED
+│   └── grid_manager/                  # ✅ YOUR CODE
+│       ├── __init__.py
+│       ├── grid_optimizer.py          # GridOptimizer class (strategies 1, 3, 4+2)
+│       ├── optimized_worker.py        # Parallel-safe worker with strategy cascade
+│       ├── optimized_pipeline.py      # New main() with optimization loop
+│       └── benchmark.py              # A vs B comparison tool
+└── config/
+    └── default.json                   # Updated: optimization params
+```
+
+---
+
+## Verification Plan
+
+### Benchmark Comparison
+
+```bash
+python run.py --benchmark
+```
+
+**Expected output:**
+
+| Metric | Original | Optimized | Diff |
+|---|---|---|---|
+| Execution Time | ~60s | ~25-40s | 30-60% faster |
+| Avg Density L1 | 0.0XXX | 0.0XXX | < 5% RMSE |
+| Vehicle Count | N | N ± 2 | ± 2 vehicles |
+| FPS | ~25 | ~40-60 | 1.5-2.5× |
+
+**Per-strategy breakdown:**
+
+| Strategy | Skip Rate (expected) |
+|---|---|
+| Temporal (main process) | ~80% of frames |
+| Pixel Activity (worker) | ~30-60% of remaining |
+| Sentinel (worker) | ~20-40% of remaining |
+| Full Compute | ~10-30% of all frames |
+
+> [!NOTE]
+> Temporal sub-sampling will slightly reduce tracking precision for fast-moving vehicles. The `subsample_interval` config parameter (default: 5) is tunable — lower = more accurate, higher = faster.
