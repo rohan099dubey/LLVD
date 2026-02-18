@@ -32,6 +32,9 @@ BRIGHTNESS_NIGHT = 50
 BRIGHTNESS_DUSK = 120
 FOG_THRESHOLD = 0.6
 
+# Fast mode — set True by CLI to swap expensive ops for faster alternatives
+FAST_MODE = False
+
 # Rain detection thresholds
 RAIN_STD_THRESHOLD = 35.0
 RAIN_VERT_RATIO = 1.5
@@ -200,6 +203,16 @@ def classify_scene(frame_gray):
 
     return lighting, is_foggy, is_rainy, brightness, fog_index
 
+# Fast fog compensation — CLAHE on V channel (replaces DCP in fast mode)
+@time_function
+def dehaze_fast(img_bgr):
+    """Lightweight fog compensation via CLAHE on the V channel."""
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+    h, s, v = cv2.split(hsv)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    v = clahe.apply(v)
+    return cv2.cvtColor(cv2.merge([h, s, v]), cv2.COLOR_HSV2BGR)
+
 # Remove haze using Dark Channel Prior and guided filter
 @time_function
 def dehaze_dcp(img_bgr, omega=0.95, t_min=0.1, radius=40):
@@ -269,9 +282,12 @@ def adaptive_equalize(roi_gray, lighting):
         eq = CLAHE_DUSK.apply(roi_gray)
     else:
         eq = cv2.equalizeHist(roi_gray)
-    # Edge-preserving denoise for low-light conditions
+    # Denoise for low-light conditions
     if lighting in ('night', 'dusk'):
-        eq = cv2.bilateralFilter(eq, BILATERAL_D, BILATERAL_SIGMA_COLOR, BILATERAL_SIGMA_SPACE)
+        if FAST_MODE:
+            eq = cv2.GaussianBlur(eq, (BILATERAL_D | 1, BILATERAL_D | 1), 0)
+        else:
+            eq = cv2.bilateralFilter(eq, BILATERAL_D, BILATERAL_SIGMA_COLOR, BILATERAL_SIGMA_SPACE)
     return eq
 
 # Get detection parameters suited for current scene
@@ -471,8 +487,9 @@ def process_grid_vectorized(channel_data, grid_w, grid_h, params):
 def process_single_roi(roi_f1, roi_f2, grid_w, grid_h, lighting, is_foggy, is_rainy=False):
     # Dehaze foggy ROIs
     if is_foggy:
-        roi_f1 = dehaze_dcp(roi_f1)
-        roi_f2 = dehaze_dcp(roi_f2)
+        _dehaze = dehaze_fast if FAST_MODE else dehaze_dcp
+        roi_f1 = _dehaze(roi_f1)
+        roi_f2 = _dehaze(roi_f2)
     # Remove rain streaks
     if is_rainy:
         roi_f1 = remove_rain_streaks(roi_f1)
@@ -518,6 +535,11 @@ def worker_task(args):
 
     return frame_idx, mat1, mat2, d1, d2, comps1_data, comps2_data
 
+def _worker_init(fast_mode):
+    """Pool initializer to propagate FAST_MODE to child processes."""
+    global FAST_MODE
+    FAST_MODE = fast_mode
+
 class AsyncVideoWriter:
     def __init__(self, path, fourcc, fps, frame_size):
         self._writer = cv2.VideoWriter(path, fourcc, fps, frame_size)
@@ -555,6 +577,10 @@ def _crop_rois(frame):
 @time_function
 def _enhance_frame_for_display(frame, lighting, is_foggy, is_rainy):
     """Apply all visual enhancements to the output frame for display."""
+    # In fast mode, skip all display enhancement for speed
+    if FAST_MODE:
+        return
+
     # Full-frame dehazing for fog
     if is_foggy:
         frame[:] = dehaze_dcp(frame)
@@ -562,13 +588,15 @@ def _enhance_frame_for_display(frame, lighting, is_foggy, is_rainy):
     if is_rainy:
         frame[:] = remove_rain_streaks(frame)
 
-    # ROI-level equalization + gamma + bilateral
+    # ROI-level equalization + gamma + bilateral (color-preserving via HSV)
     for (rx, ry, rw, rh) in [ROI1, ROI2]:
         roi = frame[ry:ry + rh, rx:rx + rw]
-        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        gray = apply_gamma(gray, lighting)
-        eq = adaptive_equalize(gray, lighting)
-        frame[ry:ry + rh, rx:rx + rw] = cv2.cvtColor(eq, cv2.COLOR_GRAY2BGR)
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        h, s, v = cv2.split(hsv)
+        v = apply_gamma(v, lighting)
+        v = adaptive_equalize(v, lighting)
+        hsv_enhanced = cv2.merge([h, s, v])
+        frame[ry:ry + rh, rx:rx + rw] = cv2.cvtColor(hsv_enhanced, cv2.COLOR_HSV2BGR)
 
 # Yields batches of ROI crops for processing
 def batch_roi_generator(video_source, batch_size):
@@ -812,14 +840,15 @@ def main():
           f" (bright={init_bright:.0f}, fog_idx={init_fog_idx:.2f})")
     print(f"Features: Tracking | Counting | Speed | Night/Fog/Rain Adapt")
     print(f"Grid: {NUM_ROWS}x{NUM_COLS} | "
-          f"Fast-path: {'grayscale' if _USE_GRAYSCALE_FASTPATH else 'HSV'}")
+          f"Fast-path: {'grayscale' if _USE_GRAYSCALE_FASTPATH else 'HSV'}"
+          f"{' | FAST MODE' if FAST_MODE else ''}")
 
     d_lane1, d_lane2 = [], []
     speed_samples_l1, speed_samples_l2 = [], []
     scene_log = []
     frame_count = 0
 
-    with Pool(processes=n_procs) as pool:
+    with Pool(processes=n_procs, initializer=_worker_init, initargs=(FAST_MODE,)) as pool:
         pbar = tqdm(total=total_frames, desc="Processing frames")
         gen = batch_roi_generator(VIDEO_PATH, batch_size)
         
